@@ -32,6 +32,7 @@ type config struct {
 	outdir   string     // output directory
 	url      string     // sourcemap url
 	jsurl    string     // javascript url
+	dir      string     // directory of sourcemap files to process
 	proxy    string     // upstream proxy server
 	insecure bool       // skip tls verification
 	headers  headerList // additional user-supplied http headers
@@ -277,27 +278,80 @@ func cleanWindows(p string) string {
 	return m1.ReplaceAllString(p, "")
 }
 
+// processSourceMap extracts source files from a parsed sourcemap into outdir.
+func processSourceMap(sm sourceMap, outdir string) error {
+	log.Printf("[+] Retrieved Sourcemap with version %d, containing %d entries.\n", sm.Version, len(sm.Sources))
+
+	if len(sm.Sources) == 0 {
+		return errors.New("no sources found")
+	}
+
+	if len(sm.SourcesContent) == 0 {
+		return errors.New("no source content found")
+	}
+
+	if sm.Version != 3 {
+		log.Println("[!] Sourcemap is not version 3. This is untested!")
+	}
+
+	if _, err := os.Stat(outdir); os.IsNotExist(err) {
+		err = os.Mkdir(outdir, 0700)
+		if err != nil {
+			return err
+		}
+	}
+
+	for i, sourcePath := range sm.Sources {
+		sourcePath = "/" + sourcePath // path.Clean will ignore a leading '..', must be a '/..'
+		// If on windows, clean the sourcepath.
+		if runtime.GOOS == "windows" {
+			sourcePath = cleanWindows(sourcePath)
+		}
+
+		// Use filepath.Join. https://parsiya.net/blog/2019-03-09-path.join-considered-harmful/
+		scriptPath, scriptData := filepath.Join(outdir, filepath.Clean(sourcePath)), sm.SourcesContent[i]
+		err := writeFile(scriptPath, scriptData)
+		if err != nil {
+			log.Printf("Error writing %s file: %s", scriptPath, err)
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	var proxyURL url.URL
 	var conf config
 	var err error
 
 	flag.StringVar(&conf.outdir, "output", "", "Source file output directory - REQUIRED")
-	flag.StringVar(&conf.url, "url", "", "URL or path to the Sourcemap file - cannot be used with jsurl")
-	flag.StringVar(&conf.jsurl, "jsurl", "", "URL to JavaScript file - cannot be used with url")
+	flag.StringVar(&conf.url, "url", "", "URL or path to the Sourcemap file")
+	flag.StringVar(&conf.jsurl, "jsurl", "", "URL to JavaScript file")
+	flag.StringVar(&conf.dir, "dir", "", "Directory of .map files to process recursively")
 	flag.StringVar(&conf.proxy, "proxy", "", "Proxy URL")
 	help := flag.Bool("help", false, "Show help")
 	flag.BoolVar(&conf.insecure, "insecure", false, "Ignore invalid TLS certificates")
 	flag.Var(&conf.headers, "header", "A header to send with the request, similar to curl's -H. Can be set multiple times, EG: \"./sourcemapper --header \"Cookie: session=bar\" --header \"Authorization: blerp\"")
 	flag.Parse()
 
-	if *help || (conf.url == "" && conf.jsurl == "") || conf.outdir == "" {
+	if *help || (conf.url == "" && conf.jsurl == "" && conf.dir == "") || conf.outdir == "" {
 		flag.Usage()
 		return
 	}
 
-	if conf.jsurl != "" && conf.url != "" {
-		log.Println("[!] Both -jsurl and -url supplied")
+	// Ensure only one input mode is specified
+	inputModes := 0
+	if conf.url != "" {
+		inputModes++
+	}
+	if conf.jsurl != "" {
+		inputModes++
+	}
+	if conf.dir != "" {
+		inputModes++
+	}
+	if inputModes > 1 {
+		log.Println("[!] Only one of -url, -jsurl, or -dir can be specified")
 		flag.Usage()
 		return
 	}
@@ -310,53 +364,53 @@ func main() {
 		proxyURL = *p
 	}
 
-	var sm sourceMap
-
-	// these need to just take the conf object
-	if conf.url != "" {
-		if sm, err = getSourceMap(conf.url, conf.headers, conf.insecure, proxyURL); err != nil {
-			log.Fatal(err)
-		}
-	} else if conf.jsurl != "" {
-		if sm, err = getSourceMapFromJS(conf.jsurl, conf.headers, conf.insecure, proxyURL); err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	// everything below needs to go into its own function
-	log.Printf("[+] Retrieved Sourcemap with version %d, containing %d entries.\n", sm.Version, len(sm.Sources))
-
-	if len(sm.Sources) == 0 {
-		log.Fatal("No sources found.")
-	}
-
-	if len(sm.SourcesContent) == 0 {
-		log.Fatal("No source content found.")
-	}
-
-	if sm.Version != 3 {
-		log.Println("[!] Sourcemap is not version 3. This is untested!")
-	}
-
-	if _, err := os.Stat(conf.outdir); os.IsNotExist(err) {
-		err = os.Mkdir(conf.outdir, 0700)
+	if conf.dir != "" {
+		// Walk the directory and process all .map files
+		var mapFiles []string
+		err = filepath.Walk(conf.dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".map") {
+				mapFiles = append(mapFiles, path)
+			}
+			return nil
+		})
 		if err != nil {
 			log.Fatal(err)
 		}
-	}
+		if len(mapFiles) == 0 {
+			log.Fatalf("[!] No .map files found in %s", conf.dir)
+		}
+		log.Printf("[+] Found %d .map files in %s", len(mapFiles), conf.dir)
 
-	for i, sourcePath := range sm.Sources {
-		sourcePath = "/" + sourcePath // path.Clean will ignore a leading '..', must be a '/..'
-		// If on windows, clean the sourcepath.
-		if runtime.GOOS == "windows" {
-			sourcePath = cleanWindows(sourcePath)
+		for _, mapFile := range mapFiles {
+			log.Printf("[+] Processing: %s", mapFile)
+			sm, err := getSourceMap(mapFile, conf.headers, conf.insecure, proxyURL)
+			if err != nil {
+				log.Printf("[!] Error reading %s: %s, skipping.", mapFile, err)
+				continue
+			}
+			if err := processSourceMap(sm, conf.outdir); err != nil {
+				log.Printf("[!] Error processing %s: %s, skipping.", mapFile, err)
+				continue
+			}
+		}
+	} else {
+		var sm sourceMap
+
+		if conf.url != "" {
+			if sm, err = getSourceMap(conf.url, conf.headers, conf.insecure, proxyURL); err != nil {
+				log.Fatal(err)
+			}
+		} else if conf.jsurl != "" {
+			if sm, err = getSourceMapFromJS(conf.jsurl, conf.headers, conf.insecure, proxyURL); err != nil {
+				log.Fatal(err)
+			}
 		}
 
-		// Use filepath.Join. https://parsiya.net/blog/2019-03-09-path.join-considered-harmful/
-		scriptPath, scriptData := filepath.Join(conf.outdir, filepath.Clean(sourcePath)), sm.SourcesContent[i]
-		err := writeFile(scriptPath, scriptData)
-		if err != nil {
-			log.Printf("Error writing %s file: %s", scriptPath, err)
+		if err := processSourceMap(sm, conf.outdir); err != nil {
+			log.Fatal(err)
 		}
 	}
 

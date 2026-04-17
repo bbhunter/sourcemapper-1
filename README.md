@@ -32,6 +32,8 @@ pacman -S sourcemapper
 ```text
 :~$ ./sourcemapper
 Usage of ./sourcemapper:
+  -dir string
+    	Directory of .map files to process recursively
   -header value
     	A header to send with the request, similar to curl's -H. Can be set multiple times, EG: "./sourcemapper --header "Cookie: session=bar" --header "Authorization: blerp"
   -help
@@ -39,14 +41,16 @@ Usage of ./sourcemapper:
   -insecure
     	Ignore invalid TLS certificates
   -jsurl string
-    	URL to JavaScript file - cannot be used with url
+    	URL to JavaScript file
   -output string
     	Source file output directory - REQUIRED
   -proxy string
     	Proxy URL
   -url string
-    	URL or path to the Sourcemap file - cannot be used with jsurl
+    	URL or path to the Sourcemap file
 ```
+
+Only one of `-url`, `-jsurl`, or `-dir` can be specified at a time.
 
 ## Extracting SourceMaps from .map URLs or local files
 
@@ -83,6 +87,22 @@ doi@asov:~/dhubsrc$ cd webpack\:/app/scripts/components/
 ```
 
 Sourcemapper will download or read the map file at `url`, and then spit the sources out into the directory defined by `output`. `url` can be either an URL, or a path to a map file on disk. Extracting a sourcemap to a file can get around sourcemaps configured with `sourceMappingURL=data:application/json;.... base64 blob...` by decoding the blob into a file, then passing the file path to sourcemapper. Alternatively, `data:` URL can be handled by directly parsing the JavaScript file as discussed in the following section.
+
+## Batch processing a directory of .map files
+
+Pass `-dir` instead of `-url` to recursively walk a directory and extract sources from every `.map` file found. Bad or empty sourcemaps are logged and skipped so one broken file doesn't stop the batch.
+
+```text
+$ ./sourcemapper -dir ./maps -output ./src
+[+] Found 12 .map files in ./maps
+[+] Processing: maps/app.js.map
+[+] Retrieving Sourcemap from maps/app.js.map...
+[+] Retrieved Sourcemap with version 3, containing 234 entries.
+...
+[+] Processing: maps/vendor.js.map
+...
+[+] Done
+```
 
 ## Extracting SourceMaps directly from JavaScript files
 
